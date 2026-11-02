@@ -1,4 +1,6 @@
 """Database session management."""
+from pathlib import Path
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -31,6 +33,10 @@ def create_db_engine(settings: Settings):
     connect_args = {}
     if settings.database_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
+        # a fresh clone has no data/ folder (it is gitignored): create it so SQLite can create the file
+        db_file = settings.database_url.split("///", 1)[-1]
+        if db_file and db_file != ":memory:":
+            Path(db_file).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     
     engine = create_engine(
         settings.database_url,
