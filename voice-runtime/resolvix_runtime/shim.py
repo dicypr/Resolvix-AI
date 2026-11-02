@@ -92,7 +92,7 @@ async def generate_sse_stream(
                 yield f"data: {json.dumps(meta_chunk, separators=(',', ':'))}\n\n"
 
             elif event.type == "action":
-                await executor.execute(event.action, lang=current_lang)
+                await executor.execute(event.action, lang=current_lang, blocking=getattr(event, "blocking", True))
 
                 # Stream any extra injected speech produced by this action (e.g. transfer failed line)
                 while executor.injected_speech:
@@ -125,6 +125,7 @@ async def generate_sse_stream(
 
             elif event.type == "done":
                 assert isinstance(event, DoneEvent)
+                await executor.wait_pending()
                 # Post turn summary in background non-blocking
                 asyncio.create_task(ops_client.post_turn(call_id, event.summary))
 

@@ -23,6 +23,8 @@ class SessionState:
     transfers_connected: bool = False
     emergency: bool = False
     is_ended: bool = False
+    agora_agent_id: str | None = None
+    agora_channel: str | None = None
 
     def next_turn_index(self) -> int:
         self.turn_count += 1

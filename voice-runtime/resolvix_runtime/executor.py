@@ -47,8 +47,9 @@ class ActionExecutor:
         self.ops_unreachable: bool = False
         self.injected_speech: list[str] = []
         self.last_sms_status: str | None = None
+        self.pending_tasks: list[asyncio.Task] = []
 
-    async def execute(self, action: Action, lang: str = "hinglish") -> None:
+    async def execute(self, action: Action, lang: str = "hinglish", blocking: bool = True) -> None:
         kind = action.kind
         if kind == "create_ticket":
             assert isinstance(action, CreateTicketAction)
@@ -59,7 +60,13 @@ class ActionExecutor:
             await self._handle_transfer(action, lang)
         elif kind == "send_sms":
             assert isinstance(action, SendSmsAction)
-            await self._handle_send_sms(action)
+            # In emergency path or when non-blocking, send SMS concurrently in background
+            # so the caller's emergency transfer or next actions are never delayed awaiting SMS delivery.
+            if not blocking or self.session.emergency:
+                task = asyncio.create_task(self._handle_send_sms(action))
+                self.pending_tasks.append(task)
+            else:
+                await self._handle_send_sms(action)
         elif kind == "log_gap":
             assert isinstance(action, LogGapAction)
             await self._handle_log_gap(action)
@@ -257,3 +264,9 @@ class ActionExecutor:
             text = text.replace("{{ticket_id}}", spoken_id)
 
         return text
+
+    async def wait_pending(self) -> None:
+        """Await all background tasks (such as asynchronous SMS) to complete cleanly."""
+        if self.pending_tasks:
+            await asyncio.gather(*self.pending_tasks, return_exceptions=True)
+            self.pending_tasks.clear()
