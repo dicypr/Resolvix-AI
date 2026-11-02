@@ -46,6 +46,7 @@ class ActionExecutor:
         self.ticket_id: str | None = None
         self.ops_unreachable: bool = False
         self.injected_speech: list[str] = []
+        self.last_sms_status: str | None = None
 
     async def execute(self, action: Action, lang: str = "hinglish") -> None:
         kind = action.kind
@@ -191,7 +192,33 @@ class ActionExecutor:
             ticket_id=self.ticket_id,
         )
         res = await self.ops_client.post_sms(sms_req)
-        logger.info("Sent SMS result: %s", res)
+        if res is not None:
+            self.last_sms_status = res.status
+            if res.status in ("queued", "sent", "delivered"):
+                logger.info(
+                    "SMS %s for %s (id: %s, mode: %s)",
+                    res.status,
+                    action.to_number,
+                    res.message_id,
+                    res.mode,
+                )
+            elif res.status == "suppressed":
+                logger.info(
+                    "SMS suppressed for %s: %s (id: %s)",
+                    action.to_number,
+                    res.reason,
+                    res.message_id,
+                )
+            else:
+                logger.warning(
+                    "SMS failed for %s: %s (id: %s)",
+                    action.to_number,
+                    res.reason,
+                    res.message_id,
+                )
+        else:
+            self.last_sms_status = "failed"
+            logger.warning("ops.post_sms returned None (queued in retry queue)")
 
     async def _handle_log_gap(self, action: LogGapAction) -> None:
         gap = GapCreate(

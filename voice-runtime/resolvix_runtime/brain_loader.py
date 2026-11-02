@@ -31,10 +31,13 @@ def get_brain(settings: RuntimeSettings | None = None) -> Brain:
             _BRAIN_INSTANCE = create_brain(BrainSettings.from_env())
         except ImportError as e:
             logger.error(
-                "BRAIN_IMPL is set to 'real', but resolvix_brain cannot be imported (%s). Falling back to MockBrain.",
+                "BRAIN_IMPL is set to 'real', but resolvix_brain cannot be imported (%s). Failing loudly.",
                 e,
             )
-            _BRAIN_INSTANCE = MockBrain()
+            raise RuntimeError(
+                f"BRAIN_IMPL is set to 'real', but resolvix_brain cannot be imported: {e}. "
+                "Ensure brain is installed ('pip install -e brain') or PYTHONPATH includes brain."
+            ) from e
     else:
         logger.info("Initializing MockBrain from fixture streams.")
         _BRAIN_INSTANCE = MockBrain()

@@ -45,6 +45,33 @@ This log records the integration gates, verification drills, and component miles
   7. Bearer token auth enforcement.
   8. Static test and web call pages.
 
-### Drill 3: End-to-End Replay against Ops API
-- Command: `pytest integration/e2e_test.py`
-- Executable against `dev/ops_stub.py` or Member C's production ops-api on port 8100.
+### Drill 3: End-to-End Replay against Real Ops API & Real Brain
+- **Environment:**
+  - Ops API: Real `resolvix_ops` on port 8100, SQLite database seeded with `ops/api/dev/seed.py` (4 demo users, 13 KB entries).
+  - Brain: Real `resolvix_brain` (`ResolvixBrain`) with `LLM_MODE=mock` and active KB `99152f80995e` (12 entries).
+  - Runtime: Real voice runtime on port 8000 with `BRAIN_IMPL=real`, `SERVICE_KEY=change-me`, `OPS_API_URL=http://localhost:8100`.
+- **Health Verification:**
+  - `GET http://localhost:8000/healthz`: `{"status": "ok", "brain": {"status": "ok", "kb_version": "99152f80995e", "llm": "ok"}, "ops_api": "ok"}`
+- **Test Command:**
+  - `pytest integration/e2e_test.py -v`
+- **Result:**
+  - **PASS** (9 passed in 0.40s).
+- **Verified Scenarios:**
+  - [x] Scenario 01: FAQ Hindi answer (`test_01_faq_answer`)
+  - [x] Scenario 02: English answer (`test_02_llm_answer`)
+  - [x] Scenario 03: Unknown question -> ticket + gap (`test_03_unknown_ticket`)
+  - [x] Scenario 04: Urgent exam clash -> P1 ticket + transfer (`test_04_urgent_exam_transfer`)
+  - [x] Scenario 05: Emergency safety pre-check -> P1 ticket (`test_05_emergency_safety`)
+  - [x] Scenario 06: Complaint read-back and confirmation (`test_06_complaint_confirmed`)
+  - [x] Scenario 07: Human operator request (`test_07_human_request`)
+  - [x] Scenario 08: Failure fallback spoken ladder (`test_08_failure_fallback`)
+  - [x] Scenario 09: Partial answer with follow-up (`test_09_partial_answer`)
+
+---
+
+## 4. Audit Fixes Implemented (PR #6 Follow-Up)
+1. **`executor.py` (~193)**: Explicitly reads and validates `SmsResult.status` (`queued`, `sent`, `delivered`, `suppressed`, `failed`) and stores `self.last_sms_status` on the executor.
+2. **`brain_loader.py` (~33)**: Fails loudly with a descriptive `RuntimeError` if `BRAIN_IMPL=real` and `resolvix_brain` cannot be imported, eliminating silent mock fallbacks.
+3. **`Makefile`**: Target `run-ops` updated to run from `ops/api` (`cd ops/api && python -m uvicorn resolvix_ops.app:app --port 8100`).
+4. **Root `.env.example`**: Added `KB_EXPORT_SERVICE_KEY`, `KB_SOURCE`, `RUNTIME_MODE`, `OPS_PUBLIC_URL`, and `SEED_PASSWORD`.
+5. **E2E Verification**: Verified all 9 scenarios against seeded real ops-api and real brain with clean 100% pass rate.

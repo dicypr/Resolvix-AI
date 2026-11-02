@@ -8,7 +8,7 @@ test-runtime:
 
 run-ops:
 	@if [ -d "ops/api" ]; then \
-		uvicorn resolvix_ops.app:app --port 8100 --reload; \
+		cd ops/api && python -m uvicorn resolvix_ops.app:app --port 8100; \
 	else \
 		python voice-runtime/dev/ops_stub.py; \
 	fi
