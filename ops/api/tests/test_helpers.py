@@ -24,3 +24,13 @@ def test_default_clock_is_real(ops_app):
 def test_app_factory_overrides(app_factory):
     app = app_factory(notify_async=True)
     assert app.state.settings.sms_async is True
+
+
+def test_fresh_clone_without_a_data_folder_starts(tmp_path):
+    from resolvix_ops.app import create_app
+    from resolvix_ops.config import Settings
+    db = tmp_path / "missing" / "nested" / "x.db"
+    app = create_app(Settings(_env_file=None, database_url=f"sqlite:///{db.as_posix()}", service_key="k" * 20,
+                              session_secret="s" * 32, seed_users_on_startup=False, sms_poll_enabled=False))
+    app.state.engine.dispose()
+    assert db.exists()
