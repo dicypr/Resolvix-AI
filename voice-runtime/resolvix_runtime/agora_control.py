@@ -185,9 +185,12 @@ class AgoraController:
                 "enable_string_uid": False,
                 "idle_timeout": 120,
                 "llm": {
+                    "vendor": "custom",
+                    "style": "openai",
                     "url": llm_url,
                     "api_key": self.settings.shim_api_key,
-                    "greeting": greeting,
+                    "greeting_message": greeting,
+                    "failure_message": "Sorry, I am having trouble responding right now. Please hold on or try again.",
                     "params": {
                         "model": "resolvix-brain",
                     },

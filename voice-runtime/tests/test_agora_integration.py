@@ -110,6 +110,15 @@ async def test_agora_agent_join_payload_shape_and_voices():
         assert props["agent_rtc_uid"] == "1000"
         assert props["remote_rtc_uids"] == ["555666"]
 
+        # Check LLM: vendor custom, style openai, greeting_message, failure_message
+        llm = props["llm"]
+        assert llm["vendor"] == "custom"
+        assert llm["style"] == "openai"
+        assert llm["greeting_message"] == "Namaste, main Resolvix AI hoon."
+        assert "greeting" not in llm
+        assert "failure_message" in llm
+        assert len(llm["failure_message"]) > 0
+
         # Check A-8: Deepgram Nova-3 + language multi
         asr = props["asr"]
         assert asr["vendor"] == "deepgram"
@@ -612,4 +621,238 @@ async def test_emergency_sms_typed_endpoint_does_not_block_response():
                 assert sms_completed is True, "Background SMS task must have completed when draining on end!"
     finally:
         bl.reset_brain()
+
+
+@pytest.mark.asyncio
+async def test_shim_call_outcome_import_and_call_end():
+    """Verify shim.py imports CallOutcome and executes end-of-call teardown without NameError."""
+    from typing import AsyncGenerator
+    from resolvix_contracts.models import (
+        CallOutcome,
+        DoneEvent,
+        EndCallAction,
+        Lang,
+        MetaEvent,
+        Path,
+        SpeechEvent,
+        TurnRequest,
+        TurnSummary,
+    )
+    import resolvix_runtime.brain_loader as bl
+    from resolvix_runtime.shim import generate_sse_stream
+
+    class MockEndingBrain:
+        async def handle_turn(self, req: TurnRequest) -> AsyncGenerator:
+            yield MetaEvent(path=Path.faq, lang=Lang.en)
+            yield SpeechEvent(text="Goodbye.")
+            yield DoneEvent(summary=TurnSummary(
+                call_id=req.call_id,
+                turn_index=req.turn_index,
+                path=Path.faq,
+                lang=Lang.en,
+                user_text_redacted=req.user_text,
+                assistant_text="Goodbye.",
+                created_at=datetime.now(timezone.utc),
+            ))
+
+        async def end_call(self, call_id: str) -> None:
+            pass
+
+    bl.reset_brain()
+    bl._BRAIN_INSTANCE = MockEndingBrain()
+
+    try:
+        settings = RuntimeSettings(port=8000, ops_api_url="http://localhost:8100", service_key="test-key")
+        ops_client = OpsClient(settings)
+        session = SessionState(call_id="call-shim-end-001")
+        # Mark session as ended to trigger line 188 in shim.py
+        session.is_ended = True
+
+        closed_calls = []
+
+        async with respx.mock(base_url="http://localhost:8100", assert_all_called=False) as mock:
+            mock.post(url__regex=r"/v1/calls/.+/turns").mock(
+                return_value=respx.MockResponse(201, json={"status": "stored"})
+            )
+            mock.post(url__regex=r"/v1/calls/.+/end").mock(
+                side_effect=lambda req: closed_calls.append(json.loads(req.content))
+                or respx.MockResponse(200, json={"status": "ended"})
+            )
+
+            req = TurnRequest(
+                call_id="call-shim-end-001",
+                turn_index=1,
+                user_text="bye",
+                history=[],
+                dtmf=None,
+                received_at=datetime.now(timezone.utc),
+            )
+
+            chunks = []
+            async for sse in generate_sse_stream("call-shim-end-001", 1, req, session, settings, ops_client):
+                chunks.append(sse)
+
+            assert len(chunks) > 0
+            # Verify call end was posted with CallOutcome
+            assert len(closed_calls) == 1
+            assert closed_calls[0]["outcome"] == CallOutcome.answered
+            assert closed_calls[0]["ai_resolved"] is True
+    finally:
+        bl.reset_brain()
+
+
+@pytest.mark.asyncio
+async def test_speech_and_injected_speech_streaming_spacing():
+    """Verify sentence chunk spacing between SpeechEvent and Action injected speech."""
+    from typing import AsyncGenerator
+    from resolvix_contracts.models import (
+        ActionEvent,
+        DoneEvent,
+        Lang,
+        MetaEvent,
+        Path,
+        SpeechEvent,
+        TransferAction,
+        TurnRequest,
+        TurnSummary,
+    )
+    import resolvix_runtime.brain_loader as bl
+    from resolvix_runtime.shim import generate_sse_stream
+
+    class MockMultiChunkBrain:
+        async def handle_turn(self, req: TurnRequest) -> AsyncGenerator:
+            yield MetaEvent(path=Path.faq, lang=Lang.en)
+            # 1. Speech chunk 1
+            yield SpeechEvent(text="Please hold.")
+            # 2. Action that generates injected speech
+            yield ActionEvent(
+                action=TransferAction(
+                    department="admissions",
+                    to_number="+910000000001",
+                    reason="inquiry",
+                    brief="transfer",
+                    requires_ticket=False,
+                ),
+                blocking=True,
+            )
+            # 3. Speech chunk 2
+            yield SpeechEvent(text="How else can I help?")
+            yield DoneEvent(summary=TurnSummary(
+                call_id=req.call_id,
+                turn_index=req.turn_index,
+                path=Path.faq,
+                lang=Lang.en,
+                user_text_redacted=req.user_text,
+                assistant_text="Please hold. Transfer failed. How else can I help?",
+                created_at=datetime.now(timezone.utc),
+            ))
+
+    bl.reset_brain()
+    bl._BRAIN_INSTANCE = MockMultiChunkBrain()
+
+    try:
+        settings = RuntimeSettings(
+            port=8000,
+            ops_api_url="http://localhost:8100",
+            service_key="test-key",
+            telephony_transfer_success=False,  # Triggers transfer_failed injected speech
+        )
+        ops_client = OpsClient(settings)
+        session = SessionState(call_id="call-spacing-test", channel=CallChannel.pstn)
+
+        req = TurnRequest(
+            call_id="call-spacing-test",
+            turn_index=1,
+            user_text="transfer me",
+            history=[],
+            dtmf=None,
+            received_at=datetime.now(timezone.utc),
+        )
+
+        deltas = []
+        async with respx.mock(base_url="http://localhost:8100", assert_all_called=False) as mock:
+            mock.post(url__regex=r"/v1/tickets/.+/events").mock(
+                return_value=respx.MockResponse(201, json={"status": "stored"})
+            )
+            mock.post(url__regex=r"/v1/calls/.+/turns").mock(
+                return_value=respx.MockResponse(201, json={"status": "stored"})
+            )
+
+            async for sse in generate_sse_stream("call-spacing-test", 1, req, session, settings, ops_client):
+                line = sse.strip()
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    payload = json.loads(line[6:])
+                    if "choices" in payload and payload["choices"]:
+                        delta = payload["choices"][0]["delta"]
+                        if "content" in delta:
+                            deltas.append(delta["content"])
+
+        # First chunk: "Please hold."
+        # Injected speech: " " + fail_line
+        # Third chunk: " How else can I help?"
+        assert len(deltas) >= 3
+        concatenated = "".join(deltas)
+        assert "Please hold." in concatenated
+        assert "How else can I help?" in concatenated
+        # Must not contain concatenated words without spaces (e.g. "hold.Transfer" or "line.How")
+        assert "hold.Transfer" not in concatenated
+        assert "line.How" not in concatenated
+        assert "hold. " in concatenated or "hold. Transfer" in concatenated or "hold. Main" in concatenated
+    finally:
+        bl.reset_brain()
+
+
+@pytest.mark.asyncio
+async def test_english_only_deepgram_and_elevenlabs_config_defaults():
+    """Verify Phase 1.1 English-only Deepgram Nova-3 and ElevenLabs flash configuration."""
+    app_id = "970ca35de60c4464bb03a650e680fb9d"
+    app_cert = "5cfd2fd1755d40ecb729f39468aa3dbb"
+
+    # Default settings without explicit overrides
+    settings = RuntimeSettings(
+        port=8000,
+        agora_app_id=app_id,
+        agora_app_certificate=app_cert,
+        agora_customer_id="cust-123",
+        agora_customer_secret="secret-456",
+    )
+
+    # 1. Check default settings in config.py
+    assert settings.asr_vendor == "deepgram"
+    assert settings.asr_model == "nova-3"
+    assert settings.asr_language == "en"  # English-only default for Phase 1.1
+    assert settings.asr_credential_mode == "byok"
+    assert settings.tts_vendor == "elevenlabs"
+    assert settings.tts_model == "eleven_flash_v2_5"
+    assert settings.tts_voice_id == "pNInz6obpgDQGcFmaJgB"
+    assert settings.tts_credential_mode == "byok"
+
+    # 2. Check generated join payload uses English-only ASR language "en"
+    ops_client = OpsClient(settings)
+    controller = AgoraController(settings, ops_client)
+
+    captured_payloads = []
+
+    async with respx.mock(base_url="https://api.agora.io", assert_all_called=False) as agora_mock:
+        agora_mock.post(f"/api/conversational-ai-agent/v2/projects/{app_id}/join").mock(
+            side_effect=lambda req: captured_payloads.append(json.loads(req.content))
+            or respx.MockResponse(200, json={"agent_id": "agent-en-001", "status": "RUNNING"})
+        )
+
+        agent_id = await controller._start_agora_agent(
+            channel="test-channel-en",
+            call_id="call-web-en",
+            llm_url="https://resolvix.example.com/v1/chat/completions",
+            greeting="Hello! Welcome to Resolvix support.",
+            user_uid=12345,
+        )
+
+        assert agent_id == "agent-en-001"
+        assert len(captured_payloads) == 1
+        props = captured_payloads[0]["properties"]
+        assert props["asr"]["params"]["language"] == "en"
+        assert props["asr"]["params"]["model"] == "nova-3"
+        assert props["tts"]["params"]["model_id"] == "eleven_flash_v2_5"
+        assert props["tts"]["params"]["voice_id"] == "pNInz6obpgDQGcFmaJgB"
+
 

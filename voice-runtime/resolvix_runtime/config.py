@@ -32,7 +32,7 @@ class RuntimeSettings:
     agora_customer_secret: str = ""
     asr_vendor: str = "deepgram"
     asr_api_key: str = ""
-    asr_language: str = "multi"
+    asr_language: str = "en"  # English-only for Phase 1.1 real voice test
     asr_model: str = "nova-3"
     asr_credential_mode: str = "byok"  # "byok" or "managed"
     tts_vendor: str = "elevenlabs"
@@ -68,7 +68,7 @@ class RuntimeSettings:
             agora_customer_secret=os.getenv("AGORA_CUSTOMER_SECRET", ""),
             asr_vendor=os.getenv("ASR_VENDOR", "deepgram"),
             asr_api_key=os.getenv("ASR_API_KEY", ""),
-            asr_language=os.getenv("ASR_LANGUAGE", "multi"),
+            asr_language=os.getenv("ASR_LANGUAGE", "en"),
             asr_model=os.getenv("ASR_MODEL", "nova-3"),
             asr_credential_mode=os.getenv("ASR_CREDENTIAL_MODE", "byok").lower(),
             tts_vendor=os.getenv("TTS_VENDOR", "elevenlabs"),

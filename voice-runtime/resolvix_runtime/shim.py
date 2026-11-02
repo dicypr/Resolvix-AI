@@ -15,6 +15,7 @@ from resolvix_contracts.models import (
     CallChannel,
     CallContext,
     CallEnd,
+    CallOutcome,
     CallStart,
     ChatMessage,
     DoneEvent,
@@ -54,6 +55,22 @@ def parse_call_id(query_call_id: str | None, messages: list[dict[str, Any]]) -> 
     new_id = f"call-gen-{uuid.uuid4().hex[:8]}"
     logger.warning("No call_id provided in query or system message. Generated fallback call_id: %s", new_id)
     return new_id
+
+
+def format_speech_chunk(text: str, is_first_speech: bool, last_speech_text: str) -> tuple[str, bool, str]:
+    """Ensure clean sentence chunk spacing across streamed Brain and injected speech events."""
+    if not text:
+        return "", is_first_speech, last_speech_text
+
+    if is_first_speech:
+        cleaned = text.lstrip()
+        return cleaned, False, cleaned
+
+    if last_speech_text and not last_speech_text[-1].isspace() and not text.startswith((" ", "\n", "\t")):
+        formatted = " " + text
+    else:
+        formatted = text
+    return formatted, False, formatted
 
 
 async def generate_sse_stream(
@@ -98,11 +115,13 @@ async def generate_sse_stream(
                 # Stream any extra injected speech produced by this action (e.g. transfer failed line)
                 while executor.injected_speech:
                     injected_text = executor.injected_speech.pop(0)
-                    if not is_first_speech and last_speech_text and not last_speech_text[-1].isspace() and not injected_text.startswith((" ", "\n", "\t")):
-                        injected_text = " " + injected_text
-                    delta = {"role": "assistant", "content": injected_text} if is_first_speech else {"content": injected_text}
-                    is_first_speech = False
-                    last_speech_text = injected_text
+                    if not injected_text or not injected_text.strip():
+                        continue
+                    was_first = is_first_speech
+                    injected_text, is_first_speech, last_speech_text = format_speech_chunk(
+                        injected_text, is_first_speech, last_speech_text
+                    )
+                    delta = {"role": "assistant", "content": injected_text} if was_first else {"content": injected_text}
                     speech_chunk = {
                         "id": chunk_id,
                         "object": "chat.completion.chunk",
@@ -115,12 +134,12 @@ async def generate_sse_stream(
             elif event.type == "speech":
                 assert isinstance(event, SpeechEvent)
                 processed_text = executor.process_speech_text(event.text, lang=current_lang)
-                if processed_text:
-                    if not is_first_speech and last_speech_text and not last_speech_text[-1].isspace() and not processed_text.startswith((" ", "\n", "\t")):
-                        processed_text = " " + processed_text
-                    delta = {"role": "assistant", "content": processed_text} if is_first_speech else {"content": processed_text}
-                    is_first_speech = False
-                    last_speech_text = processed_text
+                if processed_text and processed_text.strip():
+                    was_first = is_first_speech
+                    processed_text, is_first_speech, last_speech_text = format_speech_chunk(
+                        processed_text, is_first_speech, last_speech_text
+                    )
+                    delta = {"role": "assistant", "content": processed_text} if was_first else {"content": processed_text}
                     speech_chunk = {
                         "id": chunk_id,
                         "object": "chat.completion.chunk",
@@ -142,7 +161,11 @@ async def generate_sse_stream(
         logger.error("Unhandled error during handle_turn for call_id=%s: %s", call_id, e, exc_info=True)
         # Never fail HTTP after streaming starts. Stream fallback line and log SYSTEM_FAILURE ticket.
         fallback_text = settings.get_runtime_line("fallback", current_lang)
-        err_delta = {"role": "assistant", "content": fallback_text} if is_first_speech else {"content": fallback_text}
+        was_first = is_first_speech
+        fallback_text, is_first_speech, last_speech_text = format_speech_chunk(
+            fallback_text, is_first_speech, last_speech_text
+        )
+        err_delta = {"role": "assistant", "content": fallback_text} if was_first else {"content": fallback_text}
         err_chunk = {
             "id": chunk_id,
             "object": "chat.completion.chunk",
