@@ -1,0 +1,12 @@
+services:
+  - type: web
+    plan: free
+    name: akgec-chatbot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port 10000"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9
+      - key: GROQ_API_KEY
+      - key: PC_API_KEY

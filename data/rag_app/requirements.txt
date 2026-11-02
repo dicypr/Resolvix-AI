@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-dotenv
+pydantic
+pinecone[grpc]
+groq
+slowapi
+instructor
+crawl4ai
+ipykernel
+langchain
+langchain-groq
+langchain-pinecone
