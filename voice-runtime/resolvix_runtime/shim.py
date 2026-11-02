@@ -73,6 +73,7 @@ async def generate_sse_stream(
 
     current_lang = "hinglish"
     is_first_speech = True
+    last_speech_text = ""
 
     agen = brain.handle_turn(req)
     try:
@@ -97,8 +98,11 @@ async def generate_sse_stream(
                 # Stream any extra injected speech produced by this action (e.g. transfer failed line)
                 while executor.injected_speech:
                     injected_text = executor.injected_speech.pop(0)
+                    if not is_first_speech and last_speech_text and not last_speech_text[-1].isspace() and not injected_text.startswith((" ", "\n", "\t")):
+                        injected_text = " " + injected_text
                     delta = {"role": "assistant", "content": injected_text} if is_first_speech else {"content": injected_text}
                     is_first_speech = False
+                    last_speech_text = injected_text
                     speech_chunk = {
                         "id": chunk_id,
                         "object": "chat.completion.chunk",
@@ -112,8 +116,11 @@ async def generate_sse_stream(
                 assert isinstance(event, SpeechEvent)
                 processed_text = executor.process_speech_text(event.text, lang=current_lang)
                 if processed_text:
+                    if not is_first_speech and last_speech_text and not last_speech_text[-1].isspace() and not processed_text.startswith((" ", "\n", "\t")):
+                        processed_text = " " + processed_text
                     delta = {"role": "assistant", "content": processed_text} if is_first_speech else {"content": processed_text}
                     is_first_speech = False
+                    last_speech_text = processed_text
                     speech_chunk = {
                         "id": chunk_id,
                         "object": "chat.completion.chunk",
@@ -125,8 +132,7 @@ async def generate_sse_stream(
 
             elif event.type == "done":
                 assert isinstance(event, DoneEvent)
-                await executor.wait_pending()
-                # Post turn summary in background non-blocking
+                # Post turn summary in background non-blocking without delaying response stream
                 asyncio.create_task(ops_client.post_turn(call_id, event.summary))
 
     except asyncio.CancelledError:

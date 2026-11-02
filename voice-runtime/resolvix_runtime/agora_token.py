@@ -114,6 +114,32 @@ class ServiceRtc(Service):
         return super().pack() + pack_string(self._channel_name) + pack_string(self._uid)
 
 
+class ServiceRtm(Service):
+    kServiceType = 2
+    kPrivilegeLogin = 1
+
+    def __init__(self, user_id: str | int = "") -> None:
+        super().__init__(ServiceRtm.kServiceType)
+        if user_id == 0 or user_id == "0":
+            self._user_id = b""
+        else:
+            self._user_id = str(user_id).encode("utf-8")
+
+    def pack(self) -> bytes:
+        return super().pack() + pack_string(self._user_id)
+
+
+class ServiceConvoAI(Service):
+    """Agora Conversational AI Engine service (Service Type 9)."""
+    kServiceType = 9
+
+    def __init__(self) -> None:
+        super().__init__(ServiceConvoAI.kServiceType)
+
+    def pack(self) -> bytes:
+        return super().pack()
+
+
 # --- AccessToken2 Core ---
 
 
@@ -231,5 +257,70 @@ def generate_rtc_token(
     if not token:
         # If credentials are not valid 32-hex UUIDs (e.g. test dummy values), return a mock token
         return f"mock-token-{channel_name}-{uid}"
+
+    return token
+
+
+class ConvoAITokenBuilder:
+    """Builds official Agora AccessToken2 (v007) containing RTC, RTM, and ConvoAI services."""
+
+    @staticmethod
+    def build_token(
+        app_id: str,
+        app_certificate: str,
+        channel_name: str,
+        account: int | str,
+        role: int = RtcTokenBuilder.Role_Publisher,
+        token_expire: int = 3600,
+        privilege_expire: int = 3600,
+    ) -> str:
+        token = AccessToken(app_id, app_certificate, expire=token_expire)
+
+        # 1. RTC Service (audio/video/datastream permissions)
+        service_rtc = ServiceRtc(channel_name, account)
+        service_rtc.add_privilege(ServiceRtc.kPrivilegeJoinChannel, privilege_expire)
+        if role == RtcTokenBuilder.Role_Publisher:
+            service_rtc.add_privilege(ServiceRtc.kPrivilegePublishAudioStream, privilege_expire)
+            service_rtc.add_privilege(ServiceRtc.kPrivilegePublishVideoStream, privilege_expire)
+            service_rtc.add_privilege(ServiceRtc.kPrivilegePublishDataStream, privilege_expire)
+        token.add_service(service_rtc)
+
+        # 2. RTM Service (messaging / signaling)
+        service_rtm = ServiceRtm(account)
+        service_rtm.add_privilege(ServiceRtm.kPrivilegeLogin, privilege_expire)
+        token.add_service(service_rtm)
+
+        # 3. ConvoAI Service (service type 9)
+        token.add_service(ServiceConvoAI())
+
+        return token.build()
+
+
+def generate_convoai_token(
+    app_id: str,
+    app_certificate: str,
+    channel_name: str,
+    uid: int | str,
+    expire_seconds: int = 3600,
+    role: int = RtcTokenBuilder.Role_Publisher,
+) -> str:
+    """Generate an official combined RTC + RTM + ConvoAI token (v007).
+
+    Falls back to mock token only if app_id or app_certificate are missing or not 32-char hex.
+    """
+    if not app_id or not app_certificate:
+        return f"mock-convoai-token-{channel_name}-{uid}"
+
+    token = ConvoAITokenBuilder.build_token(
+        app_id=app_id.strip(),
+        app_certificate=app_certificate.strip(),
+        channel_name=channel_name,
+        account=uid,
+        role=role,
+        token_expire=expire_seconds,
+        privilege_expire=expire_seconds,
+    )
+    if not token:
+        return f"mock-convoai-token-{channel_name}-{uid}"
 
     return token

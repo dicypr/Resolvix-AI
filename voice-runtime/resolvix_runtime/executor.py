@@ -64,6 +64,7 @@ class ActionExecutor:
             # so the caller's emergency transfer or next actions are never delayed awaiting SMS delivery.
             if not blocking or self.session.emergency:
                 task = asyncio.create_task(self._handle_send_sms(action))
+                self.session.add_background_task(task)
                 self.pending_tasks.append(task)
             else:
                 await self._handle_send_sms(action)
@@ -198,34 +199,38 @@ class ActionExecutor:
             call_id=self.session.call_id,
             ticket_id=self.ticket_id,
         )
-        res = await self.ops_client.post_sms(sms_req)
-        if res is not None:
-            self.last_sms_status = res.status
-            if res.status in ("queued", "sent", "delivered"):
-                logger.info(
-                    "SMS %s for %s (id: %s, mode: %s)",
-                    res.status,
-                    action.to_number,
-                    res.message_id,
-                    res.mode,
-                )
-            elif res.status == "suppressed":
-                logger.info(
-                    "SMS suppressed for %s: %s (id: %s)",
-                    action.to_number,
-                    res.reason,
-                    res.message_id,
-                )
+        try:
+            res = await self.ops_client.post_sms(sms_req)
+            if res is not None:
+                self.last_sms_status = res.status
+                if res.status in ("queued", "sent", "delivered"):
+                    logger.info(
+                        "SMS %s for %s (id: %s, mode: %s)",
+                        res.status,
+                        action.to_number,
+                        res.message_id,
+                        res.mode,
+                    )
+                elif res.status == "suppressed":
+                    logger.info(
+                        "SMS suppressed for %s: %s (id: %s)",
+                        action.to_number,
+                        res.reason,
+                        res.message_id,
+                    )
+                else:
+                    logger.warning(
+                        "SMS failed for %s: %s (id: %s)",
+                        action.to_number,
+                        res.reason,
+                        res.message_id,
+                    )
             else:
-                logger.warning(
-                    "SMS failed for %s: %s (id: %s)",
-                    action.to_number,
-                    res.reason,
-                    res.message_id,
-                )
-        else:
+                self.last_sms_status = "failed"
+                logger.warning("ops.post_sms returned None (queued in retry queue)")
+        except Exception as e:
             self.last_sms_status = "failed"
-            logger.warning("ops.post_sms returned None (queued in retry queue)")
+            logger.warning("Background SMS task error for %s: %s", action.to_number, e)
 
     async def _handle_log_gap(self, action: LogGapAction) -> None:
         gap = GapCreate(

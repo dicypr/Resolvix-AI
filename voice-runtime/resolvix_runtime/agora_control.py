@@ -13,7 +13,7 @@ from fastapi import HTTPException
 import httpx
 
 from resolvix_contracts.models import CallChannel, CallContext, CallEnd, CallOutcome, CallStart
-from .agora_token import generate_rtc_token
+from .agora_token import generate_convoai_token, generate_rtc_token
 from .brain_loader import get_brain
 from .config import RuntimeSettings
 from .ops_client import OpsClient
@@ -79,10 +79,34 @@ class AgoraController:
             uid=uid,
         )
 
-        # 4. If Agora credentials present, start Conversational AI agent via REST v2
+        # 4. If in real mode or Agora App ID configured, ensure customer credentials exist and start agent
         agent_id: str | None = None
         llm_url = f"{self.settings.public_base_url}/v1/chat/completions?call_id={call_id}"
-        if self.settings.agora_app_id and self.settings.agora_customer_id:
+        is_real_agora = (
+            self.settings.telephony_mode == "agora"
+            or bool(self.settings.agora_app_id and self.settings.agora_app_id != "demo-agora-app-id")
+        )
+
+        if is_real_agora:
+            if not self.settings.agora_customer_id or not self.settings.agora_customer_secret:
+                logger.error(
+                    "Real Agora mode is active, but AGORA_CUSTOMER_ID or AGORA_CUSTOMER_SECRET is missing. "
+                    "Failing loudly to prevent empty-channel browser join."
+                )
+                await self._record_join_failure(call_id)
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": {
+                            "code": "agora_config_missing_credentials",
+                            "message": (
+                                "AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET must be configured to start "
+                                "the Agora Conversational AI agent in real mode. Set them in your environment."
+                            ),
+                        }
+                    },
+                )
+
             agent_id = await self._start_agora_agent(
                 channel=channel,
                 call_id=call_id,
@@ -111,10 +135,10 @@ class AgoraController:
     ) -> str:
         """Start Agora Conversational AI Agent (v2) in the RTC channel.
 
-        Fails loudly with HTTP 502 on non-2xx response or network failure.
+        Uses the combined RTC + RTM + ConvoAI token (v007) and fails loudly with HTTP 502 on failure.
         """
         agent_uid = 1000
-        agent_token = generate_rtc_token(
+        agent_token = generate_convoai_token(
             app_id=self.settings.agora_app_id,
             app_certificate=self.settings.agora_app_certificate,
             channel_name=channel,

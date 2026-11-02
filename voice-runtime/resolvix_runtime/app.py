@@ -126,6 +126,7 @@ def create_app(settings: RuntimeSettings | None = None) -> FastAPI:
         session = registry.get(call_id)
         if session:
             session.is_ended = True
+            await session.drain_background_tasks()
             if session.agora_agent_id:
                 await agora_controller.stop_agora_agent(session.agora_agent_id)
             brain = get_brain(settings)
@@ -209,7 +210,7 @@ def create_app(settings: RuntimeSettings | None = None) -> FastAPI:
 
             elif event.type == "done":
                 assert isinstance(event, DoneEvent)
-                await executor.wait_pending()
+                # Background tasks like SMS are tracked in session.background_tasks and continue safely
                 asyncio.create_task(ops_client.post_turn(call_id, event.summary))
                 substituted_events.append(event.model_dump(mode="json"))
 
@@ -226,6 +227,7 @@ def create_app(settings: RuntimeSettings | None = None) -> FastAPI:
         session = registry.get(call_id)
         if session:
             session.is_ended = True
+            await session.drain_background_tasks()
             brain = get_brain(settings)
             await brain.end_call(call_id)
             await ops_client.post_call_end(

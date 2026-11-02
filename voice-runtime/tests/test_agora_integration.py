@@ -359,3 +359,257 @@ async def test_emergency_path_does_not_wait_for_sms_to_transfer():
         # Cleanup pending tasks - now SMS completes
         await executor.wait_pending()
         assert "sms_finished" in events_order
+
+
+# --- Additional Integration Validations ---
+
+
+@pytest.mark.asyncio
+async def test_missing_customer_id_fails_loudly_in_real_mode():
+    app_id = "970ca35de60c4464bb03a650e680fb9d"
+    app_cert = "5cfd2fd1755d40ecb729f39468aa3dbb"
+
+    settings = RuntimeSettings(
+        port=8000,
+        ops_api_url="http://localhost:8100",
+        service_key="test-key",
+        telephony_mode="agora",
+        agora_app_id=app_id,
+        agora_app_certificate=app_cert,
+        agora_customer_id="",  # MISSING
+        agora_customer_secret="",
+    )
+    ops_client = OpsClient(settings)
+    controller = AgoraController(settings, ops_client)
+
+    closed_calls = []
+
+    async with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://localhost:8100/v1/calls").mock(
+            return_value=respx.MockResponse(201, json={"status": "created"})
+        )
+        mock.post(url__regex=r"http://localhost:8100/v1/calls/.+/end").mock(
+            side_effect=lambda req: closed_calls.append(json.loads(req.content))
+            or respx.MockResponse(200, json={"status": "ended"})
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await controller.start_web_session()
+
+        assert exc_info.value.status_code == 500
+        detail = exc_info.value.detail
+        assert detail["error"]["code"] == "agora_config_missing_credentials"
+        assert "AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET must be configured" in detail["error"]["message"]
+
+        # Call must be marked failed in ops so no orphaned session remains
+        assert len(closed_calls) == 1
+        assert closed_calls[0]["outcome"] == "failed"
+
+
+def test_convoai_combined_token_builder():
+    from resolvix_runtime.agora_token import ConvoAITokenBuilder, generate_convoai_token
+
+    app_id = "970ca35de60c4464bb03a650e680fb9d"
+    app_cert = "5cfd2fd1755d40ecb729f39468aa3dbb"
+    channel = "resolvix-channel-convoai"
+    agent_uid = 1000
+
+    token = generate_convoai_token(app_id, app_cert, channel, agent_uid)
+    assert token.startswith("007"), f"Expected token to start with 007, got {token[:5]}"
+    assert len(token) > 100
+
+    # Test builder directly
+    raw_token = ConvoAITokenBuilder.build_token(
+        app_id=app_id,
+        app_certificate=app_cert,
+        channel_name=channel,
+        account=agent_uid,
+    )
+    assert raw_token.startswith("007")
+
+    # Missing cert returns mock fallback
+    mock = generate_convoai_token(app_id, "", channel, agent_uid)
+    assert mock == f"mock-convoai-token-{channel}-{agent_uid}"
+
+
+@pytest.mark.asyncio
+async def test_speech_chunk_formatting_adds_space_between_sentences():
+    from typing import AsyncGenerator
+    from resolvix_contracts.models import DoneEvent, Lang, MetaEvent, Path, SpeechEvent, TurnRequest, TurnSummary
+    import resolvix_runtime.brain_loader as bl
+    from resolvix_runtime.shim import generate_sse_stream
+
+    class MockBrainStreaming:
+        async def handle_turn(self, req: TurnRequest) -> AsyncGenerator:
+            yield MetaEvent(path=Path.faq, lang=Lang.hinglish)
+            # Yield "weekends." followed by "Anything"
+            yield SpeechEvent(text="weekends.")
+            yield SpeechEvent(text="Anything")
+            yield DoneEvent(summary=TurnSummary(
+                call_id=req.call_id,
+                turn_index=req.turn_index,
+                path=Path.faq,
+                lang=Lang.hinglish,
+                user_text_redacted=req.user_text,
+                assistant_text="weekends. Anything",
+                created_at=datetime.now(timezone.utc),
+            ))
+
+    bl.reset_brain()
+    bl._BRAIN_INSTANCE = MockBrainStreaming()
+
+    try:
+        settings = RuntimeSettings(port=8000)
+        ops_client = OpsClient(settings)
+        session = SessionState(call_id="call-speech-fmt")
+
+        req = TurnRequest(
+            call_id="call-speech-fmt",
+            turn_index=1,
+            user_text="test",
+            history=[],
+            dtmf=None,
+            received_at=datetime.now(timezone.utc),
+        )
+
+        chunks = []
+        async for sse in generate_sse_stream("call-speech-fmt", 1, req, session, settings, ops_client):
+            line = sse.strip()
+            if line.startswith("data: ") and line != "data: [DONE]":
+                payload = json.loads(line[6:])
+                if "choices" in payload and payload["choices"]:
+                    delta = payload["choices"][0]["delta"]
+                    if "content" in delta:
+                        chunks.append(delta["content"])
+
+        # First chunk is "weekends.", second chunk should be formatted with leading space " Anything"
+        assert chunks == ["weekends.", " Anything"]
+        concatenated = "".join(chunks)
+        assert concatenated == "weekends. Anything"
+    finally:
+        bl.reset_brain()
+
+
+@pytest.mark.asyncio
+async def test_emergency_sms_typed_endpoint_does_not_block_response():
+    import time
+    from typing import AsyncGenerator
+    from resolvix_contracts.models import (
+        ActionEvent,
+        DoneEvent,
+        Lang,
+        MetaEvent,
+        Path,
+        Priority,
+        SendSmsAction,
+        SpeechEvent,
+        TicketCreate,
+        TicketType,
+        TurnRequest,
+        TurnSummary,
+    )
+    import resolvix_runtime.brain_loader as bl
+
+    class MockEmergencyBrain:
+        async def start_call(self, ctx: CallContext):
+            from resolvix_contracts.models import CallStartPlan
+            return CallStartPlan(
+                kb_version="mock-kb",
+                greeting_text="Hello",
+                greeting_lang=Lang.hinglish,
+                interruptable=False,
+            )
+
+        async def handle_turn(self, req: TurnRequest) -> AsyncGenerator:
+            yield MetaEvent(path=Path.safety, lang=Lang.hinglish)
+            yield ActionEvent(
+                action=CreateTicketAction(
+                    ticket=TicketCreate(
+                        idempotency_key="em-turn-key",
+                        call_id=req.call_id,
+                        type=TicketType.EMERGENCY,
+                        priority=Priority.P1,
+                        priority_reason="medical",
+                        department="emergency",
+                        summary="Student emergency",
+                        collected_fields={},
+                        caller_number="+919000000001",
+                        callback_number=None,
+                        callback_requested=False,
+                        transcript_excerpt="help",
+                        brief="Emergency",
+                    )
+                ),
+                blocking=True,
+            )
+            yield ActionEvent(
+                action=SendSmsAction(
+                    idempotency_key="sms-turn-key",
+                    to_number="+919999999999",
+                    template_id="staff_alert",
+                    vars={"ticket_id": "{{ticket_id}}"},
+                    consent="staff",
+                ),
+                blocking=False,
+            )
+            yield SpeechEvent(text="Emergency team alerted.")
+            yield DoneEvent(summary=TurnSummary(
+                call_id=req.call_id,
+                turn_index=req.turn_index,
+                path=Path.safety,
+                lang=Lang.hinglish,
+                user_text_redacted=req.user_text,
+                assistant_text="Emergency team alerted.",
+                created_at=datetime.now(timezone.utc),
+            ))
+
+        async def end_call(self, call_id: str) -> None:
+            pass
+
+    bl.reset_brain()
+    bl._BRAIN_INSTANCE = MockEmergencyBrain()
+
+    try:
+        settings = RuntimeSettings(port=8000, ops_api_url="http://localhost:8100", service_key="test-key")
+        app = create_app(settings)
+
+        sms_completed = False
+
+        async with respx.mock(base_url="http://localhost:8100", assert_all_called=False) as mock:
+            mock.post("/v1/tickets").mock(
+                return_value=respx.MockResponse(201, json={"ticket_id": "EM-2002", "created": True})
+            )
+            mock.post(url__regex=r"/v1/tickets/.+/events").mock(
+                return_value=respx.MockResponse(201, json={"status": "stored"})
+            )
+            mock.post(url__regex=r"/v1/calls/.+/turns").mock(
+                return_value=respx.MockResponse(201, json={"status": "stored"})
+            )
+            mock.post(url__regex=r"/v1/calls/.+/end").mock(
+                return_value=respx.MockResponse(200, json={"status": "ended"})
+            )
+
+            async def delayed_sms(req):
+                nonlocal sms_completed
+                await asyncio.sleep(0.4)
+                sms_completed = True
+                return respx.MockResponse(202, json={"message_id": "sms-delayed", "status": "sent", "mode": "mock"})
+
+            mock.post("/v1/notifications/sms").mock(side_effect=delayed_sms)
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                start_t = time.perf_counter()
+                resp = await ac.post("/api/test/turn", json={"call_id": "call-typed-emerg-1", "text": "help"})
+                elapsed = time.perf_counter() - start_t
+
+                assert resp.status_code == 200
+                assert elapsed < 0.25, f"Turn response took {elapsed:.3f}s, waited for SMS!"
+                assert sms_completed is False, "SMS task should still be executing in the background!"
+
+                resp_end = await ac.post("/api/test/end", json={"call_id": "call-typed-emerg-1"})
+                assert resp_end.status_code == 200
+                assert sms_completed is True, "Background SMS task must have completed when draining on end!"
+    finally:
+        bl.reset_brain()
+
